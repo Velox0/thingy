@@ -16,7 +16,9 @@ void enableRawMode() {
 
   struct termios raw = orig_termios;
   raw.c_iflag &= ~(ICRNL | IXON); // fix CTRL M | disable CTRL S/Q
+  raw.c_iflag &= ~(BRKINT | INPCK | ISTRIP); // misc
   raw.c_oflag &= ~(OPOST); // disable POST PROCESSING
+  raw.c_cflag |= (CS8); // misc
   raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG); // disable ECHO | CANONICAL MODE | CTRL V | DISABLE KEYBOARD INTERRUPT
 
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
