@@ -30,12 +30,12 @@ void die(const char *s) {
   exit(1);
 }
 
-void disableRawMode() {
+void disableRawMode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
     die("tcsetattr");
 }
 
-void enableRawMode() {
+void enableRawMode(void) {
   if (tcgetattr(STDIN_FILENO, &orig_termios)) die("tcgetattr");
   atexit(disableRawMode);
 
@@ -51,7 +51,7 @@ void enableRawMode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
-char editorReadKey() {
+char editorReadKey(void) {
   int nread;
   char c;
   while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
@@ -62,17 +62,32 @@ char editorReadKey() {
 
 /*** output ***/
 
-void editorRefreshScreen() {
+void getCursorXY(int *cx, int *cy) {
+  *cx = 0;
+  *cy = 0;
+  for (int i = 0; i < cursor_pos; i++) {
+    if (buffer[i] == '\n') {
+      (*cy)++;
+    } else if (buffer[i] == '\r') {
+      *cx = 0;
+    } else {
+      (*cx)++;
+    }
+  }
+}
+
+void editorRefreshScreen(void) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
 
   write(STDOUT_FILENO, buffer, buf_len);
 
-  if (cursor_pos < buf_len) {
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "\x1b[%dD", buf_len - cursor_pos);
-    write(STDOUT_FILENO, buf, len);
-  }
+  int cx, cy;
+  getCursorXY(&cx, &cy);
+
+  char buf[32];
+  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cy + 1, cx + 1);
+  write(STDOUT_FILENO, buf, len);
 }
 
 /*** input ***/
@@ -86,7 +101,7 @@ void editorInsertChar(char c) {
   }
 }
 
-void editorDelChar() {
+void editorDelChar(void) {
   if (cursor_pos > 0) {
     memmove(&buffer[cursor_pos - 1], &buffer[cursor_pos], buf_len - cursor_pos);
     buf_len--;
@@ -94,7 +109,7 @@ void editorDelChar() {
   }
 }
 
-void editorProcessKeypress() {
+void editorProcessKeypress(void) {
   char c = editorReadKey();
 
   switch (c) {
@@ -106,7 +121,12 @@ void editorProcessKeypress() {
 
     case 127: // backspace
     case 8: // ctrl-h
-      editorDelChar();
+      if (cursor_pos >= 2 && buffer[cursor_pos - 1] == '\n' && buffer[cursor_pos - 2] == '\r') {
+        editorDelChar(); // del \n
+        editorDelChar(); // del \r
+      } else {
+        editorDelChar();
+      }
       break;
 
     case '\x1b': { // escape sequence (arrows)
@@ -116,10 +136,22 @@ void editorProcessKeypress() {
       if (seq[0] == '[') {
         switch (seq[1]) {
           case 'C': // Right
-            if (cursor_pos < buf_len) cursor_pos++;
+            if (cursor_pos < buf_len) {
+              if (buffer[cursor_pos] == '\r' && cursor_pos + 1 < buf_len && buffer[cursor_pos + 1] == '\n') {
+                cursor_pos += 2;
+              } else {
+                cursor_pos++;
+              }
+            }
             break;
           case 'D': // Left
-            if (cursor_pos > 0) cursor_pos--;
+            if (cursor_pos > 0) {
+              if (buffer[cursor_pos - 1] == '\n' && cursor_pos >= 2 && buffer[cursor_pos - 2] == '\r') {
+                cursor_pos -= 2;
+              } else {
+                cursor_pos--;
+              }
+            }
             break;
         }
       }
@@ -128,8 +160,12 @@ void editorProcessKeypress() {
 
     default:
       if (!iscntrl(c) || c == '\n' || c == '\r') {
-        if (c == '\r') c = '\n';
-        editorInsertChar(c);
+        if (c == '\r' || c == '\n') {
+          editorInsertChar('\r');
+          editorInsertChar('\n');
+        } else {
+          editorInsertChar(c);
+        }
       }
       break;
   }
@@ -137,7 +173,7 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-int main() {
+int main(void) {
   enableRawMode();
 
   while (1) {
