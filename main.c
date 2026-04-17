@@ -63,6 +63,15 @@ char editorReadKey(void) {
 
 /*** buffer operations ***/
 
+int buf_len(void) {
+  return buf_size - gap_end + gap_start;
+}
+
+char charAt(int i) {
+  if (i < gap_start) return buffer[i];
+  return buffer[i + (gap_end - gap_start)];
+}
+
 void reallocBuffer(void) {
   int new_size = buf_size * 2;
   char *new_buffer = malloc(new_size);
@@ -145,20 +154,117 @@ void editorDelChar(void) {
   }
 }
 
-int buf_len(void) {
-  return buf_size - gap_end + gap_start;
+void editorCursorUp(void) {
+  int cx, cy;
+  getCursorXY(&cx, &cy);
+  if (cy == 0) return;
+
+  int target_x = cx;
+  while (gap_start > 0) {
+    if (buffer[gap_start - 1] == '\r') {
+      moveGap(gap_start - 2);
+      break;
+    }
+    moveGap(gap_start - 1);
+  }
+
+  // Now we are at the end of the previous line (or at the \n \r).
+  // Wait, let's step back completely until the line starts, then go forward X steps.
+
+  // We are at the end of previous line. Let's find the start of the previous line.
+  while (gap_start > 0 && buffer[gap_start - 1] != '\n') {
+    moveGap(gap_start - 1);
+  }
+
+  if (gap_start > 0 && buffer[gap_start - 1] == '\n') {
+    // we found \n, skip over \r if present
+    if (gap_start < buf_len() && charAt(gap_start) == '\r') {
+      moveGap(gap_start + 1);
+    }
+  }
+
+  for (int i = 0; i < target_x; i++) {
+    if (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
+      moveGap(gap_start + 1);
+    } else {
+      break;
+    }
+  }
 }
 
-char charAt(int i) {
-  if (i < gap_start) return buffer[i];
-  return buffer[i + (gap_end - gap_start)];
+void editorCursorDown(void) {
+  int cx, cy;
+  getCursorXY(&cx, &cy);
+
+  int target_x = cx;
+
+  while (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
+    moveGap(gap_start + 1);
+  }
+  if (gap_start < buf_len() && charAt(gap_start) == '\r') {
+    moveGap(gap_start + 1); // move past \r
+  }
+  if (gap_start < buf_len() && charAt(gap_start) == '\n') {
+    moveGap(gap_start + 1); // move past \n
+  } else {
+    return; // no next line
+  }
+
+  for (int i = 0; i < target_x; i++) {
+    if (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
+      moveGap(gap_start + 1);
+    } else {
+      break;
+    }
+  }
+}
+
+void editorSave(void) {
+  if (buf_len() == 0) return;
+
+  char filename[256];
+  int t = 0;
+  for (int i = 0; i < buf_len(); i++) {
+    char c = charAt(i);
+    if (c == '\r' || c == '\n') break;
+    if (t < (int)sizeof(filename) - 1) {
+      filename[t++] = c;
+    }
+  }
+  filename[t] = '\0';
+
+  if (t == 0) return; // no name extracted
+
+  FILE *fp = fopen(filename, "w");
+  if (!fp) die("fopen");
+
+  // Seek t to the start of the next line if we stopped at a newline
+  if (t < buf_len() && (charAt(t) == '\r' || charAt(t) == '\n')) {
+    while (t < buf_len() && (charAt(t) == '\r' || charAt(t) == '\n')) {
+      t++;
+    }
+  }
+
+  for (int i = t; i < gap_start; i++) {
+    if (buffer[i] != '\r') fputc(buffer[i], fp);
+  }
+  for (int i = gap_end; i < buf_size; i++) {
+    if (buffer[i] != '\r') fputc(buffer[i], fp);
+  }
+
+  fclose(fp);
 }
 
 void editorProcessKeypress(void) {
   char c = editorReadKey();
 
   switch (c) {
+    case CTRL_KEY('s'):
+      editorSave();
+      break;
+
     case CTRL_KEY('q'):
+      editorSave(); // Optionally save on quit
       write(STDOUT_FILENO, "\x1b[2J", 4);
       write(STDOUT_FILENO, "\x1b[H", 3);
       exit(0);
@@ -180,6 +286,12 @@ void editorProcessKeypress(void) {
       if (read(STDIN_FILENO, &seq[1], 1) != 1) break;
       if (seq[0] == '[') {
         switch (seq[1]) {
+          case 'A': // Up
+            editorCursorUp();
+            break;
+          case 'B': // Down
+            editorCursorDown();
+            break;
           case 'C': // Right
             if (gap_start < buf_len()) {
               if (charAt(gap_start) == '\r' && gap_start + 1 < buf_len() && charAt(gap_start + 1) == '\n') {
