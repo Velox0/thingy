@@ -1,345 +1,375 @@
-/*** includes ***/
-
 #include <ctype.h>
-#include <errno.h>
+#include <limits.h>
+#include <ncurses.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <termios.h>
-#include <unistd.h>
 
-/*** defines ***/
+#include "buffer.h"
+#include "runner.h"
 
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define BUF_SIZE 1024
 
-/*** data ***/
+typedef struct {
+  TextBuffer buffer;
+  FoldList folds;
+  int cx;
+  int cy;
+  int row_offset;
+  int col_offset;
+  int screen_rows;
+  int screen_cols;
+  int output_visible;
+  char *output_text;
+  char status[256];
+  char filename[PATH_MAX];
+  int should_quit;
+} Editor;
 
-struct termios orig_termios;
-
-char *buffer;
-int buf_size = BUF_SIZE;
-int gap_start = 0;
-int gap_end = BUF_SIZE;
-
-/*** terminal ***/
-
-void die(const char *s) {
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
-  perror(s);
-  exit(1);
+static char *dup_str(const char *s) {
+  size_t len = strlen(s);
+  char *copy = malloc(len + 1);
+  if (!copy) return NULL;
+  memcpy(copy, s, len + 1);
+  return copy;
 }
 
-void disableRawMode(void) {
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
-    die("tcsetattr");
+static void set_status(Editor *ed, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(ed->status, sizeof(ed->status), fmt, ap);
+  va_end(ap);
 }
 
-void enableRawMode(void) {
-  if (tcgetattr(STDIN_FILENO, &orig_termios)) die("tcgetattr");
-  atexit(disableRawMode);
-
-  struct termios raw = orig_termios;
-  raw.c_iflag &= ~(ICRNL | IXON); // fix CTRL M | disable CTRL S/Q
-  raw.c_iflag &= ~(BRKINT | INPCK | ISTRIP); // misc
-  raw.c_oflag &= ~(OPOST); // disable POST PROCESSING
-  raw.c_cflag |= (CS8); // misc
-  raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG); // disable ECHO | CANONICAL MODE | CTRL V | DISABLE KEYBOARD INTERRUPT
-  raw.c_cc[VMIN] = 0;
-  raw.c_cc[VTIME] = 1;
-
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+static void set_output(Editor *ed, const char *text) {
+  char *copy = dup_str(text ? text : "");
+  if (!copy) return;
+  free(ed->output_text);
+  ed->output_text = copy;
 }
 
-char editorReadKey(void) {
-  int nread;
-  char c;
-  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
-    if (nread == -1 && errno != EAGAIN) die("read");
-  }
-  return c;
+static void clamp_cursor(Editor *ed) {
+  buffer_clamp_cursor(&ed->buffer, &ed->cy, &ed->cx);
 }
 
-/*** buffer operations ***/
-
-int buf_len(void) {
-  return buf_size - gap_end + gap_start;
+static int output_height(const Editor *ed) {
+  if (!ed->output_visible) return 0;
+  if (ed->screen_rows < 8) return 3;
+  return ed->screen_rows / 3;
 }
 
-char charAt(int i) {
-  if (i < gap_start) return buffer[i];
-  return buffer[i + (gap_end - gap_start)];
+static int text_rows(const Editor *ed) {
+  int rows = ed->screen_rows - 1 - output_height(ed);
+  return rows > 0 ? rows : 1;
 }
 
-void reallocBuffer(void) {
-  int new_size = buf_size * 2;
-  char *new_buffer = malloc(new_size);
-  if (!new_buffer) die("malloc");
+static void scroll_editor(Editor *ed) {
+  int rows = text_rows(ed);
 
-  int right_len = buf_size - gap_end;
-  int new_gap_end = new_size - right_len;
+  if (ed->cy < ed->row_offset) ed->row_offset = ed->cy;
+  if (ed->cy >= ed->row_offset + rows) ed->row_offset = ed->cy - rows + 1;
 
-  memcpy(new_buffer, buffer, gap_start);
-  memcpy(new_buffer + new_gap_end, buffer + gap_end, right_len);
-
-  free(buffer);
-  buffer = new_buffer;
-  buf_size = new_size;
-  gap_end = new_gap_end;
-}
-
-void moveGap(int target_pos) {
-  if (target_pos == gap_start) return;
-
-  if (target_pos < gap_start) {
-    int move_len = gap_start - target_pos;
-    gap_start -= move_len;
-    gap_end -= move_len;
-    memmove(buffer + gap_end, buffer + gap_start, move_len);
-  } else {
-    int move_len = target_pos - gap_start;
-    memmove(buffer + gap_start, buffer + gap_end, move_len);
-    gap_start += move_len;
-    gap_end += move_len;
+  if (ed->cx < ed->col_offset) ed->col_offset = ed->cx;
+  if (ed->cx >= ed->col_offset + ed->screen_cols) {
+    ed->col_offset = ed->cx - ed->screen_cols + 1;
   }
 }
 
+static const char *tail_start(const char *text, int max_lines) {
+  const char *start = text;
+  const char *p;
+  int lines = 0;
 
-/*** output ***/
+  if (!text || max_lines <= 0) return "";
 
-void getCursorXY(int *cx, int *cy) {
-  *cx = 0;
-  *cy = 0;
-  for (int i = 0; i < gap_start; i++) {
-    if (buffer[i] == '\n') {
-      (*cy)++;
-    } else if (buffer[i] == '\r') {
-      *cx = 0;
-    } else {
-      (*cx)++;
+  for (p = text; *p; p++) {
+    if (*p == '\n') lines++;
+  }
+  if (lines <= max_lines) return text;
+
+  for (p = text + strlen(text); p > text; p--) {
+    if (p[-1] == '\n') {
+      lines--;
+      if (lines <= max_lines) {
+        start = p;
+        break;
+      }
+    }
+  }
+
+  return start;
+}
+
+static void draw_status(Editor *ed) {
+  char line[512];
+
+  snprintf(line, sizeof(line),
+           "%s  Ln %d, Col %d  |  ^S Save  ^R Run  ^F Fold  ^O Output  ^Q Quit",
+           ed->filename, ed->cy + 1, ed->cx + 1);
+  attron(A_REVERSE);
+  mvhline(0, 0, ' ', ed->screen_cols);
+  mvaddnstr(0, 0, line, ed->screen_cols);
+  attroff(A_REVERSE);
+}
+
+static void draw_editor_area(Editor *ed) {
+  int rows = text_rows(ed);
+  int y;
+
+  for (y = 0; y < rows; y++) {
+    int file_row = ed->row_offset + y;
+    int screen_y = y + 1;
+
+    move(screen_y, 0);
+    clrtoeol();
+
+    if (file_row >= ed->buffer.line_count) {
+      mvaddch(screen_y, 0, '~');
+      continue;
+    }
+
+    {
+      const char *line = ed->buffer.lines[file_row];
+      int len = (int)strlen(line);
+      if (len > ed->col_offset) {
+        mvaddnstr(screen_y, 0, line + ed->col_offset, ed->screen_cols);
+      }
     }
   }
 }
 
-void editorRefreshScreen(void) {
-  write(STDOUT_FILENO, "\x1b[2J", 4);
-  write(STDOUT_FILENO, "\x1b[H", 3);
+static void draw_output(Editor *ed) {
+  int panel_h = output_height(ed);
+  int panel_top = ed->screen_rows - panel_h;
+  int content_rows = panel_h - 1;
+  int i;
+  const char *cursor;
 
-  write(STDOUT_FILENO, buffer, gap_start);
-  if (buf_size - gap_end > 0) {
-    write(STDOUT_FILENO, buffer + gap_end, buf_size - gap_end);
-  }
+  if (panel_h <= 0) return;
 
-  int cx, cy;
-  getCursorXY(&cx, &cy);
+  attron(A_REVERSE);
+  mvhline(panel_top, 0, ' ', ed->screen_cols);
+  mvaddnstr(panel_top, 0, "Output", ed->screen_cols);
+  attroff(A_REVERSE);
 
-  char buf[32];
-  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cy + 1, cx + 1);
-  write(STDOUT_FILENO, buf, len);
-}
+  cursor = tail_start(ed->output_text ? ed->output_text : "", content_rows);
+  for (i = 0; i < content_rows; i++) {
+    int row = panel_top + 1 + i;
+    const char *nl = strchr(cursor, '\n');
+    int len = nl ? (int)(nl - cursor) : (int)strlen(cursor);
 
-/*** input ***/
+    move(row, 0);
+    clrtoeol();
+    if (len > 0) mvaddnstr(row, 0, cursor, ed->screen_cols);
 
-void editorInsertChar(char c) {
-  if (gap_start == gap_end) {
-    reallocBuffer();
-  }
-  buffer[gap_start++] = c;
-}
-
-void editorDelChar(void) {
-  if (gap_start > 0) {
-    gap_start--;
+    if (!nl) break;
+    cursor = nl + 1;
   }
 }
 
-void editorCursorUp(void) {
-  int cx, cy;
-  getCursorXY(&cx, &cy);
-  if (cy == 0) return;
+static int save_file(Editor *ed) {
+  char err[256];
+  if (buffer_save_file(&ed->buffer, ed->filename, err, sizeof(err)) != 0) {
+    set_status(ed, "Save failed: %s", err);
+    return -1;
+  }
+  set_status(ed, "Saved %s", ed->filename);
+  return 0;
+}
 
-  int target_x = cx;
-  while (gap_start > 0) {
-    if (buffer[gap_start - 1] == '\r') {
-      moveGap(gap_start - 2);
+static void run_smart(Editor *ed) {
+  RunResult result;
+  char *output = NULL;
+
+  if (save_file(ed) != 0) return;
+
+  result = runner_smart_run(ed->filename, &output);
+  set_output(ed, output ? output : "");
+  free(output);
+  ed->output_visible = 1;
+
+  switch (result) {
+    case RUN_OK:
+      set_status(ed, "Run finished.");
       break;
-    }
-    moveGap(gap_start - 1);
-  }
-
-  // Now we are at the end of the previous line (or at the \n \r).
-  // Wait, let's step back completely until the line starts, then go forward X steps.
-
-  // We are at the end of previous line. Let's find the start of the previous line.
-  while (gap_start > 0 && buffer[gap_start - 1] != '\n') {
-    moveGap(gap_start - 1);
-  }
-
-  if (gap_start > 0 && buffer[gap_start - 1] == '\n') {
-    // we found \n, skip over \r if present
-    if (gap_start < buf_len() && charAt(gap_start) == '\r') {
-      moveGap(gap_start + 1);
-    }
-  }
-
-  for (int i = 0; i < target_x; i++) {
-    if (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
-      moveGap(gap_start + 1);
-    } else {
+    case RUN_COMPILE_ERROR:
+      set_status(ed, "Compilation failed.");
       break;
-    }
+    case RUN_EXEC_ERROR:
+      set_status(ed, "Execution failed.");
+      break;
+    default:
+      set_status(ed, "Run failed.");
+      break;
   }
 }
 
-void editorCursorDown(void) {
-  int cx, cy;
-  getCursorXY(&cx, &cy);
-
-  int target_x = cx;
-
-  while (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
-    moveGap(gap_start + 1);
-  }
-  if (gap_start < buf_len() && charAt(gap_start) == '\r') {
-    moveGap(gap_start + 1); // move past \r
-  }
-  if (gap_start < buf_len() && charAt(gap_start) == '\n') {
-    moveGap(gap_start + 1); // move past \n
-  } else {
-    return; // no next line
-  }
-
-  for (int i = 0; i < target_x; i++) {
-    if (gap_start < buf_len() && charAt(gap_start) != '\r' && charAt(gap_start) != '\n') {
-      moveGap(gap_start + 1);
-    } else {
-      break;
-    }
-  }
+static int cursor_on_folded_row(Editor *ed) {
+  return folds_is_folded_row(&ed->folds, ed->cy);
 }
 
-void editorSave(void) {
-  if (buf_len() == 0) return;
+static void process_keypress(Editor *ed) {
+  int ch = getch();
 
-  char filename[256];
-  int t = 0;
-  for (int i = 0; i < buf_len(); i++) {
-    char c = charAt(i);
-    if (c == '\r' || c == '\n') break;
-    if (t < (int)sizeof(filename) - 1) {
-      filename[t++] = c;
-    }
-  }
-  filename[t] = '\0';
-
-  if (t == 0) return; // no name extracted
-
-  FILE *fp = fopen(filename, "w");
-  if (!fp) die("fopen");
-
-  // Seek t to the start of the next line if we stopped at a newline
-  if (t < buf_len() && (charAt(t) == '\r' || charAt(t) == '\n')) {
-    while (t < buf_len() && (charAt(t) == '\r' || charAt(t) == '\n')) {
-      t++;
-    }
-  }
-
-  for (int i = t; i < gap_start; i++) {
-    if (buffer[i] != '\r') fputc(buffer[i], fp);
-  }
-  for (int i = gap_end; i < buf_size; i++) {
-    if (buffer[i] != '\r') fputc(buffer[i], fp);
-  }
-
-  fclose(fp);
-}
-
-void editorProcessKeypress(void) {
-  char c = editorReadKey();
-
-  switch (c) {
-    case CTRL_KEY('s'):
-      editorSave();
-      break;
-
+  switch (ch) {
     case CTRL_KEY('q'):
-      editorSave(); // Optionally save on quit
-      write(STDOUT_FILENO, "\x1b[2J", 4);
-      write(STDOUT_FILENO, "\x1b[H", 3);
-      exit(0);
+      ed->should_quit = 1;
+      return;
+
+    case CTRL_KEY('s'):
+      save_file(ed);
       break;
 
-    case 127: // backspace
-    case 8: // ctrl-h
-      if (gap_start >= 2 && buffer[gap_start - 1] == '\n' && buffer[gap_start - 2] == '\r') {
-        editorDelChar(); // del \n
-        editorDelChar(); // del \r
-      } else {
-        editorDelChar();
-      }
+    case CTRL_KEY('r'):
+      run_smart(ed);
       break;
 
-    case '\x1b': { // escape sequence (arrows)
-      char seq[3];
-      if (read(STDIN_FILENO, &seq[0], 1) != 1) break;
-      if (read(STDIN_FILENO, &seq[1], 1) != 1) break;
-      if (seq[0] == '[') {
-        switch (seq[1]) {
-          case 'A': // Up
-            editorCursorUp();
-            break;
-          case 'B': // Down
-            editorCursorDown();
-            break;
-          case 'C': // Right
-            if (gap_start < buf_len()) {
-              if (charAt(gap_start) == '\r' && gap_start + 1 < buf_len() && charAt(gap_start + 1) == '\n') {
-                moveGap(gap_start + 2);
-              } else {
-                moveGap(gap_start + 1);
-              }
-            }
-            break;
-          case 'D': // Left
-            if (gap_start > 0) {
-              if (buffer[gap_start - 1] == '\n' && gap_start >= 2 && buffer[gap_start - 2] == '\r') {
-                moveGap(gap_start - 2);
-              } else {
-                moveGap(gap_start - 1);
-              }
-            }
-            break;
-        }
-      }
+    case CTRL_KEY('o'):
+      ed->output_visible = !ed->output_visible;
+      break;
+
+    case CTRL_KEY('f'): {
+      char msg[256];
+      buffer_toggle_fold(&ed->buffer, &ed->folds, &ed->cy, msg, sizeof(msg));
+      set_status(ed, "%s", msg);
+      clamp_cursor(ed);
       break;
     }
+
+    case KEY_UP:
+      if (ed->cy > 0) ed->cy--;
+      break;
+
+    case KEY_DOWN:
+      if (ed->cy + 1 < ed->buffer.line_count) ed->cy++;
+      break;
+
+    case KEY_LEFT:
+      if (ed->cx > 0) {
+        ed->cx--;
+      } else if (ed->cy > 0) {
+        ed->cy--;
+        ed->cx = buffer_line_len(&ed->buffer, ed->cy);
+      }
+      break;
+
+    case KEY_RIGHT:
+      if (ed->cx < buffer_line_len(&ed->buffer, ed->cy)) {
+        ed->cx++;
+      } else if (ed->cy + 1 < ed->buffer.line_count) {
+        ed->cy++;
+        ed->cx = 0;
+      }
+      break;
+
+    case KEY_BACKSPACE:
+    case 127:
+      if (cursor_on_folded_row(ed)) {
+        set_status(ed, "Unfold the collapsed line before editing.");
+        break;
+      } else {
+        int deleted_row = buffer_backspace(&ed->buffer, &ed->cy, &ed->cx);
+        if (deleted_row >= 0) folds_on_line_delete(&ed->folds, deleted_row);
+      }
+      break;
+
+    case '\n':
+    case '\r':
+    case KEY_ENTER:
+      if (cursor_on_folded_row(ed)) {
+        set_status(ed, "Unfold the collapsed line before editing.");
+      } else {
+        int inserted_row = buffer_insert_newline(&ed->buffer, &ed->cy, &ed->cx);
+        if (inserted_row >= 0) folds_on_line_insert(&ed->folds, inserted_row);
+      }
+      break;
+
+    case KEY_RESIZE:
+      break;
 
     default:
-      if (!iscntrl(c) || c == '\n' || c == '\r') {
-        if (c == '\r' || c == '\n') {
-          editorInsertChar('\r');
-          editorInsertChar('\n');
+      if (isprint(ch)) {
+        if (cursor_on_folded_row(ed)) {
+          set_status(ed, "Unfold the collapsed line before editing.");
         } else {
-          editorInsertChar(c);
+          buffer_insert_char(&ed->buffer, ed->cy, ed->cx, (char)ch);
+          ed->cx++;
         }
       }
       break;
   }
+
+  clamp_cursor(ed);
 }
 
-/*** init ***/
+static void refresh_screen(Editor *ed) {
+  int screen_y;
+  int screen_x;
 
-int main(void) {
-  buffer = malloc(BUF_SIZE);
-  if (!buffer) die("malloc");
+  getmaxyx(stdscr, ed->screen_rows, ed->screen_cols);
+  clamp_cursor(ed);
+  scroll_editor(ed);
 
-  enableRawMode();
+  erase();
+  draw_status(ed);
+  draw_editor_area(ed);
+  draw_output(ed);
 
-  while (1) {
-    editorRefreshScreen();
-    editorProcessKeypress();
+  screen_y = 1 + (ed->cy - ed->row_offset);
+  screen_x = ed->cx - ed->col_offset;
+  if (screen_y < 1 || screen_y >= ed->screen_rows || screen_x < 0 || screen_x >= ed->screen_cols) {
+    screen_y = 1;
+    screen_x = 0;
+  }
+  move(screen_y, screen_x);
+  refresh();
+}
+
+static int init_editor(Editor *ed, const char *filename) {
+  char err[256];
+
+  memset(ed, 0, sizeof(*ed));
+  buffer_init(&ed->buffer);
+  folds_init(&ed->folds);
+  if (ed->buffer.line_count <= 0) return -1;
+
+  snprintf(ed->filename, sizeof(ed->filename), "%s",
+           (filename && filename[0]) ? filename : "untitled.txt");
+  if (buffer_load_file(&ed->buffer, ed->filename, err, sizeof(err)) != 0) {
+    set_status(ed, "Load failed: %s", err);
+  } else {
+    set_status(ed, "Opened %s", ed->filename);
   }
 
+  initscr();
+  raw();
+  noecho();
+  keypad(stdscr, TRUE);
+  set_escdelay(25);
+  return 0;
+}
+
+static void shutdown_editor(Editor *ed) {
+  endwin();
+  free(ed->output_text);
+  buffer_free(&ed->buffer);
+  folds_free(&ed->folds);
+}
+
+int main(int argc, char **argv) {
+  Editor ed;
+
+  if (init_editor(&ed, argc > 1 ? argv[1] : "untitled.txt") != 0) {
+    fprintf(stderr, "Failed to initialize editor.\n");
+    return 1;
+  }
+
+  while (!ed.should_quit) {
+    refresh_screen(&ed);
+    process_keypress(&ed);
+  }
+
+  shutdown_editor(&ed);
   return 0;
 }
