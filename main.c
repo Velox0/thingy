@@ -17,9 +17,10 @@
 
 struct termios orig_termios;
 
-char buffer[BUF_SIZE];
-int buf_len = 0;
-int cursor_pos = 0;
+char *buffer;
+int buf_size = BUF_SIZE;
+int gap_start = 0;
+int gap_end = BUF_SIZE;
 
 /*** terminal ***/
 
@@ -60,12 +61,48 @@ char editorReadKey(void) {
   return c;
 }
 
+/*** buffer operations ***/
+
+void reallocBuffer(void) {
+  int new_size = buf_size * 2;
+  char *new_buffer = malloc(new_size);
+  if (!new_buffer) die("malloc");
+
+  int right_len = buf_size - gap_end;
+  int new_gap_end = new_size - right_len;
+
+  memcpy(new_buffer, buffer, gap_start);
+  memcpy(new_buffer + new_gap_end, buffer + gap_end, right_len);
+
+  free(buffer);
+  buffer = new_buffer;
+  buf_size = new_size;
+  gap_end = new_gap_end;
+}
+
+void moveGap(int target_pos) {
+  if (target_pos == gap_start) return;
+
+  if (target_pos < gap_start) {
+    int move_len = gap_start - target_pos;
+    gap_start -= move_len;
+    gap_end -= move_len;
+    memmove(buffer + gap_end, buffer + gap_start, move_len);
+  } else {
+    int move_len = target_pos - gap_start;
+    memmove(buffer + gap_start, buffer + gap_end, move_len);
+    gap_start += move_len;
+    gap_end += move_len;
+  }
+}
+
+
 /*** output ***/
 
 void getCursorXY(int *cx, int *cy) {
   *cx = 0;
   *cy = 0;
-  for (int i = 0; i < cursor_pos; i++) {
+  for (int i = 0; i < gap_start; i++) {
     if (buffer[i] == '\n') {
       (*cy)++;
     } else if (buffer[i] == '\r') {
@@ -80,7 +117,10 @@ void editorRefreshScreen(void) {
   write(STDOUT_FILENO, "\x1b[2J", 4);
   write(STDOUT_FILENO, "\x1b[H", 3);
 
-  write(STDOUT_FILENO, buffer, buf_len);
+  write(STDOUT_FILENO, buffer, gap_start);
+  if (buf_size - gap_end > 0) {
+    write(STDOUT_FILENO, buffer + gap_end, buf_size - gap_end);
+  }
 
   int cx, cy;
   getCursorXY(&cx, &cy);
@@ -93,20 +133,25 @@ void editorRefreshScreen(void) {
 /*** input ***/
 
 void editorInsertChar(char c) {
-  if (buf_len < BUF_SIZE - 1) {
-    memmove(&buffer[cursor_pos + 1], &buffer[cursor_pos], buf_len - cursor_pos);
-    buffer[cursor_pos] = c;
-    buf_len++;
-    cursor_pos++;
+  if (gap_start == gap_end) {
+    reallocBuffer();
   }
+  buffer[gap_start++] = c;
 }
 
 void editorDelChar(void) {
-  if (cursor_pos > 0) {
-    memmove(&buffer[cursor_pos - 1], &buffer[cursor_pos], buf_len - cursor_pos);
-    buf_len--;
-    cursor_pos--;
+  if (gap_start > 0) {
+    gap_start--;
   }
+}
+
+int buf_len(void) {
+  return buf_size - gap_end + gap_start;
+}
+
+char charAt(int i) {
+  if (i < gap_start) return buffer[i];
+  return buffer[i + (gap_end - gap_start)];
 }
 
 void editorProcessKeypress(void) {
@@ -121,7 +166,7 @@ void editorProcessKeypress(void) {
 
     case 127: // backspace
     case 8: // ctrl-h
-      if (cursor_pos >= 2 && buffer[cursor_pos - 1] == '\n' && buffer[cursor_pos - 2] == '\r') {
+      if (gap_start >= 2 && buffer[gap_start - 1] == '\n' && buffer[gap_start - 2] == '\r') {
         editorDelChar(); // del \n
         editorDelChar(); // del \r
       } else {
@@ -136,20 +181,20 @@ void editorProcessKeypress(void) {
       if (seq[0] == '[') {
         switch (seq[1]) {
           case 'C': // Right
-            if (cursor_pos < buf_len) {
-              if (buffer[cursor_pos] == '\r' && cursor_pos + 1 < buf_len && buffer[cursor_pos + 1] == '\n') {
-                cursor_pos += 2;
+            if (gap_start < buf_len()) {
+              if (charAt(gap_start) == '\r' && gap_start + 1 < buf_len() && charAt(gap_start + 1) == '\n') {
+                moveGap(gap_start + 2);
               } else {
-                cursor_pos++;
+                moveGap(gap_start + 1);
               }
             }
             break;
           case 'D': // Left
-            if (cursor_pos > 0) {
-              if (buffer[cursor_pos - 1] == '\n' && cursor_pos >= 2 && buffer[cursor_pos - 2] == '\r') {
-                cursor_pos -= 2;
+            if (gap_start > 0) {
+              if (buffer[gap_start - 1] == '\n' && gap_start >= 2 && buffer[gap_start - 2] == '\r') {
+                moveGap(gap_start - 2);
               } else {
-                cursor_pos--;
+                moveGap(gap_start - 1);
               }
             }
             break;
@@ -174,6 +219,9 @@ void editorProcessKeypress(void) {
 /*** init ***/
 
 int main(void) {
+  buffer = malloc(BUF_SIZE);
+  if (!buffer) die("malloc");
+
   enableRawMode();
 
   while (1) {
