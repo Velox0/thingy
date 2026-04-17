@@ -1,11 +1,15 @@
-CC= gcc
-CFLAGS= -Wall -Wextra -pedantic -std=c99
+CC = gcc
+CFLAGS = -Wall -Wextra -pedantic -std=c99
+
+all: thingy
 
 thingy: main.c
-	@astyle --indent=spaces=2 $^
-	$(CC) -o $@ $^ $(CFLAGS)
-
-.PHONY: clean
+	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
-	rm thingy
+	rm -f thingy
+
+format:
+	@astyle --indent=spaces=2 main.c
+
+.PHONY: all clean format
