@@ -107,16 +107,27 @@ static void draw_status(Editor *ed) {
   snprintf(line, sizeof(line),
            "%s  Ln %d, Col %d  |  ^S Save  ^R Run  ^F Fold  ^O Output  ^Q Quit",
            ed->filename, ed->cy + 1, ed->cx + 1);
-  attron(A_REVERSE);
+  if (has_colors()) {
+    attron(COLOR_PAIR(2) | A_BOLD);
+  } else {
+    attron(A_REVERSE);
+  }
   mvhline(0, 0, ' ', ed->screen_cols);
   mvaddnstr(0, 0, line, ed->screen_cols);
-  attroff(A_REVERSE);
+  if (has_colors()) {
+    attroff(COLOR_PAIR(2) | A_BOLD);
+  } else {
+    attroff(A_REVERSE);
+  }
 }
 
 static void draw_editor_area(Editor *ed) {
   int rows = text_rows(ed);
   int y;
 
+  if (has_colors()) {
+    attron(COLOR_PAIR(1));
+  }
   for (y = 0; y < rows; y++) {
     int file_row = ed->row_offset + y;
     int screen_y = y + 1;
@@ -125,7 +136,9 @@ static void draw_editor_area(Editor *ed) {
     clrtoeol();
 
     if (file_row >= ed->buffer.line_count) {
+      if (has_colors()) attron(COLOR_PAIR(4));
       mvaddch(screen_y, 0, '~');
+      if (has_colors()) attroff(COLOR_PAIR(4));
       continue;
     }
 
@@ -136,6 +149,9 @@ static void draw_editor_area(Editor *ed) {
         mvaddnstr(screen_y, 0, line + ed->col_offset, ed->screen_cols);
       }
     }
+  }
+  if (has_colors()) {
+    attroff(COLOR_PAIR(1));
   }
 }
 
@@ -148,11 +164,22 @@ static void draw_output(Editor *ed) {
 
   if (panel_h <= 0) return;
 
-  attron(A_REVERSE);
+  if (has_colors()) {
+    attron(COLOR_PAIR(2) | A_BOLD);
+  } else {
+    attron(A_REVERSE);
+  }
   mvhline(panel_top, 0, ' ', ed->screen_cols);
   mvaddnstr(panel_top, 0, "Output", ed->screen_cols);
-  attroff(A_REVERSE);
+  if (has_colors()) {
+    attroff(COLOR_PAIR(2) | A_BOLD);
+  } else {
+    attroff(A_REVERSE);
+  }
 
+  if (has_colors()) {
+    attron(COLOR_PAIR(3));
+  }
   cursor = tail_start(ed->output_text ? ed->output_text : "", content_rows);
   for (i = 0; i < content_rows; i++) {
     int row = panel_top + 1 + i;
@@ -165,6 +192,9 @@ static void draw_output(Editor *ed) {
 
     if (!nl) break;
     cursor = nl + 1;
+  }
+  if (has_colors()) {
+    attroff(COLOR_PAIR(3));
   }
 }
 
@@ -343,6 +373,20 @@ static int init_editor(Editor *ed, const char *filename) {
   }
 
   initscr();
+  if (has_colors()) {
+    start_color();
+    // Sakura Palette:
+    // BG: Deep Purple/Black (234)
+    // FG: Soft White (255)
+    // Accent 1 (Sakura Pink): 211 or 218
+    // Accent 2 (Darker Pink): 197
+    // Accent 3 (Leaf Green): 114
+
+    init_pair(1, 218, 234); // Editor: Pink on Dark
+    init_pair(2, 234, 218); // Status: Dark on Pink
+    init_pair(3, 114, 234); // Output: Green on Dark
+    init_pair(4, 197, 234); // Special: Red/Dark Pink on Dark
+  }
   raw();
   noecho();
   keypad(stdscr, TRUE);
